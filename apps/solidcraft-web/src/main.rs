@@ -450,7 +450,6 @@ mod web {
                         };
                         let mut app = SolveApp::new(Session::default(), services);
                         let control = crate::control_client::url_from_query(&query());
-                        let controlled = control.is_some();
                         if let Some(url) = control {
                             app = app.with_control(crate::control_client::start(url, cc.egui_ctx.clone()));
                         }
@@ -468,9 +467,10 @@ mod web {
                             app.session.doc_mut().name = "Sample Plate".into();
                             app.session.mark_saved();
                         }
-                        // No start page when driven over the control channel, as on the desktop:
-                        // its clients expect the design view (`ui.home` shows it).
-                        if !query().contains("sample") && !controlled {
+                        // The start page shows even when driven over the control channel: a person
+                        // reloading the page finds their stored designs there. Agents that want the
+                        // design view hide it with `ui.home {"open": false}`.
+                        if !query().contains("sample") {
                             let rev = app.session.revision;
                             app.home.show(rev);
                         }

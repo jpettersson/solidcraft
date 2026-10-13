@@ -143,7 +143,10 @@ through the same handler as `--control`. The relay is a separate program on the 
 listens for these JSON lines on a TCP port and passes them to the page, so the MCP bridge and
 other clients connect to it as they would to the desktop app. `<url>` must be the page's own
 origin or loopback (`127.0.0.1`, `localhost`, `[::1]`); any other is ignored, so a link cannot
-hand someone's design to a remote server.
+hand someone's design to a remote server. Otherwise the page behaves as it does without the
+flag: it opens on the start page (the designs stored in the browser) and offers to recover an
+autosave, because the person looking at it may reload it. A client that wants the design view
+hides the start page with `ui.home {"open": false}`.
 
 - `GET <url>/next?tab=<id>&hidden=0|1`: the next request, `{"id", "method", "params", "files"?}`
   (200), nothing within the relay's wait (204), or 409 when a newer page has taken over (the
