@@ -3,9 +3,14 @@
 //! Runs the same [`solidcraft_ui_egui::SolveApp`] as the desktop app through eframe's web runner
 //! (wgpu: WebGPU where available, WebGL2 otherwise). Build with `trunk build --release` from this
 //! directory (output in `dist/web`). URL flags: `?webgl` forces WebGL2, `?sample` opens the
-//! sample part.
+//! sample part, `?control=<url>` takes control-channel requests from a relay at `<url>` (this
+//! page's origin or loopback; see `control_client`).
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+#[cfg(any(target_arch = "wasm32", test))]
+mod base64;
+#[cfg(target_arch = "wasm32")]
+mod control_client;
 #[cfg(target_arch = "wasm32")]
 mod files;
 
@@ -444,6 +449,11 @@ mod web {
                             ..Default::default()
                         };
                         let mut app = SolveApp::new(Session::default(), services);
+                        let control = crate::control_client::url_from_query(&query());
+                        let controlled = control.is_some();
+                        if let Some(url) = control {
+                            app = app.with_control(crate::control_client::start(url, cc.egui_ctx.clone()));
+                        }
                         if let Some(p) = cc.storage.and_then(|s| solidcraft_ui_egui::prefs::stored(|k| s.get_string(k))) {
                             app.load_prefs(&p);
                         }
@@ -458,7 +468,9 @@ mod web {
                             app.session.doc_mut().name = "Sample Plate".into();
                             app.session.mark_saved();
                         }
-                        if !query().contains("sample") {
+                        // No start page when driven over the control channel, as on the desktop:
+                        // its clients expect the design view (`ui.home` shows it).
+                        if !query().contains("sample") && !controlled {
                             let rev = app.session.revision;
                             app.home.show(rev);
                         }
