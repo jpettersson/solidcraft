@@ -625,7 +625,9 @@ fn dispatch(app: &mut SolveApp, ctx: &egui::Context, method: &str, p: &Value) ->
             let scene = solidcraft_engine::view::scene_with_section(&app.session, &app.cam, crate::viewport::section_plane(app));
             let Some(png) = render_png(&scene, &app.cam, w, h) else { return err("render failed") };
             match s("path") {
-                Some(path) => match vfs::check(path).and_then(|()| std::fs::write(path, &png)) {
+                // Through the engine's file layer (after its scope check): the disk natively, the
+                // page's file table in the browser (where the web control transport hands it on).
+                Some(path) => match vfs::check(path).and_then(|()| vfs::write(path, &png)) {
                     Ok(()) => ok(json!({"path": path, "bytes": png.len()})),
                     Err(e) => err(e),
                 },
@@ -656,11 +658,25 @@ pub fn save_screenshot(image: &egui::ColorImage, path: Option<&str>) -> Value {
         buf.extend_from_slice(&c.to_array());
     }
     let Some(img) = image::RgbaImage::from_raw(w as u32, h as u32, buf) else { return json!({"ok": false, "error": "bad image"}) };
-    let path = path.map(str::to_string).unwrap_or_else(|| std::env::temp_dir().join("solidcraft-shot.png").to_string_lossy().to_string());
-    match img.save(&path) {
+    let path = path.map(str::to_string).unwrap_or_else(default_shot_path);
+    // The format follows the extension, as `image::save` does; written through the engine's file
+    // layer (the disk natively, the page's file table in the browser).
+    let format = image::ImageFormat::from_path(&path).unwrap_or(image::ImageFormat::Png);
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    let written = img.write_to(&mut bytes, format).map_err(|e| e.to_string());
+    match written.and_then(|()| solidcraft_engine::io::vfs::write(&path, bytes.get_ref()).map_err(|e| e.to_string())) {
         Ok(()) => json!({"ok": true, "result": {"path": path, "width": w, "height": h}}),
-        Err(e) => json!({"ok": false, "error": e.to_string()}),
+        Err(e) => json!({"ok": false, "error": e}),
     }
+}
+
+/// Where a screenshot without a `path` goes. The browser has no temporary directory
+/// (`std::env::temp_dir` panics there), so the web host gets the conventional one.
+fn default_shot_path() -> String {
+    #[cfg(target_arch = "wasm32")]
+    return "/tmp/solidcraft-shot.png".to_string();
+    #[cfg(not(target_arch = "wasm32"))]
+    std::env::temp_dir().join("solidcraft-shot.png").to_string_lossy().to_string()
 }
 
 #[cfg(test)]
