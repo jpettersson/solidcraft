@@ -4,7 +4,9 @@
 //! (wgpu: WebGPU where available, WebGL2 otherwise). Build with `trunk build --release` from this
 //! directory (output in `dist/web`). URL flags: `?webgl` forces WebGL2, `?sample` opens the
 //! sample part, `?control=<url>` takes control-channel requests from a relay at `<url>` (this
-//! page's origin or loopback; see `control_client`).
+//! page's origin or loopback; see `control_client`), `?store=<url>` keeps designs in a disk
+//! store on a host (this page's origin or loopback; see `store` and docs/web-store.md) instead
+//! of only in the browser.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -13,6 +15,8 @@ mod base64;
 mod control_client;
 #[cfg(target_arch = "wasm32")]
 mod files;
+#[cfg(any(target_arch = "wasm32", test))]
+mod store;
 
 #[cfg(target_arch = "wasm32")]
 mod web {
@@ -24,6 +28,7 @@ mod web {
     use wasm_bindgen::JsCast as _;
 
     use crate::files::{self, Files, Intent};
+    use crate::store::{self, STORE, Store};
 
     const CANVAS_ID: &str = "solidcraft_canvas";
     const LOADING_ID: &str = "solidcraft_loading";
@@ -70,6 +75,12 @@ mod web {
         /// On-demand CJK font: fetched only when a CJK language is selected.
         font: solidcraft_ui_egui::fonts::CjkFontLoader,
         font_result: FontLoadResult,
+        /// The disk store (`?store=`): designs live on the host, the browser keeps a copy.
+        store: Option<Rc<Store>>,
+        /// The active design's file, for Save As (shared with the save picker).
+        active_path: Rc<std::cell::RefCell<Option<String>>>,
+        /// The active design's file at the last files tick (a write to it then is a save).
+        tick_path: Option<String>,
     }
 
     impl Shell {
@@ -78,20 +89,31 @@ mod web {
             if self.files.ctx.borrow().is_none() {
                 *self.files.ctx.borrow_mut() = Some(ctx.clone());
             }
-            files::flush(&self.files);
+            if let Some(st) = &self.store {
+                st.set_ctx(ctx);
+                // Before the writes: a design just opened is based on the version held now.
+                st.track(&solidcraft_ui_egui::documents::paths(&self.app));
+            }
+            let saved_here = files::flush(&self.files, self.store.as_ref());
+            self.adopt_into_store(&saved_here);
             for (text, error) in self.files.messages.borrow_mut().drain(..) {
                 self.app.set_status(text, error);
             }
+            self.store_tick();
             let incoming: Vec<_> = self.files.incoming.borrow_mut().drain(..).collect();
             for (name, bytes, intent) in incoming {
                 let design = solidcraft_engine::io::is_design_path(&name);
                 let path = if design && intent == Intent::Open {
-                    // A design from the computer is kept in the browser (a copy), so Save works.
-                    let path = files::free_name(&name);
+                    // A design from the computer is kept (a copy: on disk with a store, else in the
+                    // browser), so Save works.
+                    let path = match &self.store {
+                        Some(st) if store::valid_name(&name) => format!("{STORE}{}", st.free_name(&name)),
+                        _ => files::free_name(&name),
+                    };
                     if let Err(e) = vfs::write(&path, &bytes) {
                         self.app.set_status(e.to_string(), true);
                     }
-                    files::flush(&self.files);
+                    files::flush(&self.files, self.store.as_ref());
                     path
                 } else {
                     let path = format!("{}{name}", files::UPLOAD);
@@ -104,7 +126,8 @@ mod web {
                 }
                 self.files.panel.set(false);
             }
-            if self.files.ready.get() && !self.recents_synced {
+            let store_loaded = self.store.as_ref().is_none_or(|s| s.loaded.get());
+            if self.files.ready.get() && store_loaded && !self.recents_synced {
                 self.recents_synced = true;
                 self.sync_recents();
             }
@@ -115,7 +138,8 @@ mod web {
                 let changed = s.is_dirty() && self.autosaved != Some(s.revision);
                 let wait = AUTOSAVE_S - (now - self.autosaved_at);
                 if changed && wait <= 0.0 {
-                    files::autosave(&self.files, Some((&s.design(), s.path.as_deref())));
+                    let base = s.path.as_deref().and_then(|p| p.strip_prefix(STORE)).zip(self.store.as_ref()).and_then(|(n, st)| st.base_of(n));
+                    files::autosave(&self.files, Some((&s.design(), s.path.as_deref(), base)));
                     self.autosaved = Some(s.revision);
                     self.autosaved_at = now;
                 } else if changed {
@@ -126,25 +150,134 @@ mod web {
                     self.autosaved = None;
                 }
             }
+            self.tick_path = self.app.session.path.clone();
             if !self.files.ready.get() || !self.files.incoming.borrow().is_empty() {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
         }
 
-        /// The start page's recent designs are the stored ones: the remembered order first (those
-        /// still stored), then the others, newest first.
+        /// The disk store's answers: designs that now save elsewhere (a conflict), messages, and
+        /// the start page following the designs on disk.
+        fn store_tick(&mut self) {
+            let Some(st) = self.store.clone() else { return };
+            let open = solidcraft_ui_egui::documents::paths(&self.app);
+            for (from, to) in st.tick(&open, self.app.file_load.busy()) {
+                if self.app.session.path.as_deref() == Some(from.as_str()) {
+                    self.app.session.path = Some(to.clone());
+                    self.app.home.add_recent(&to);
+                }
+            }
+            for (text, error) in st.messages.borrow_mut().drain(..) {
+                // The line under the command box shows the last echo ("Save done" before this).
+                self.app.session.echo(text.clone());
+                self.app.set_status(text, error);
+            }
+            if st.changed.take() && self.recents_synced {
+                self.sync_recents();
+            }
+            *self.active_path.borrow_mut() = self.app.session.path.clone();
+        }
+
+        /// With a disk store, a design kept only in this browser that was just saved goes to the
+        /// disk too, and saves there from then on.
+        fn adopt_into_store(&mut self, saved: &[String]) {
+            let Some(st) = self.store.clone() else { return };
+            for name in saved {
+                let opfs = format!("{}{name}", files::OPFS);
+                // Saved, not just opened: the design had this file before it was written.
+                let saved = self.tick_path.as_deref() == Some(opfs.as_str()) && self.app.session.path.as_deref() == Some(opfs.as_str());
+                if !saved || !store::valid_name(name) {
+                    continue;
+                }
+                let Ok(bytes) = vfs::read(&opfs, solidcraft_engine::io::MAX_DESIGN_BYTES) else { continue };
+                let target = st.adopt(name, bytes);
+                let path = format!("{STORE}{target}");
+                self.app.session.path = Some(path.clone());
+                self.app.home.add_recent(&path);
+            }
+        }
+
+        /// The start page's recent designs are the stored ones (with a disk store, the designs on
+        /// disk): the remembered order first (those still stored), then the others, newest first.
         fn sync_recents(&mut self) {
-            let mut entries = self.files.entries.borrow().clone();
-            entries.sort_by(|a, b| b.modified.total_cmp(&a.modified));
+            let mut entries: Vec<(String, f64)> = match &self.store {
+                Some(st) => st.entries().into_iter().map(|e| (format!("{STORE}{}", e.name), e.modified)).collect(),
+                None => self.files.entries.borrow().iter().map(|e| (format!("{}{}", files::OPFS, e.name), e.modified)).collect(),
+            };
+            entries.retain(|(p, _)| solidcraft_engine::io::is_design_path(p));
+            entries.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let with_store = self.store.is_some();
             let recent = &mut self.app.home.recent;
-            recent.retain(|p| vfs::exists(p));
-            for e in entries.iter().filter(|e| solidcraft_engine::io::is_design_path(&e.name)) {
-                let p = format!("{}{}", files::OPFS, e.name);
+            // With a store, designs kept only in this browser are in the file panel (to copy them).
+            recent.retain(|p| vfs::exists(p) && !(with_store && p.starts_with(files::OPFS)));
+            for (p, _) in entries {
                 if !recent.contains(&p) {
                     recent.push(p);
                 }
             }
             recent.truncate(solidcraft_ui_egui::home::MAX_RECENT);
+        }
+
+        /// What the disk store holds, and what is on its way there (the file panel's top part).
+        fn store_section(st: &Rc<Store>, ui: &mut egui::Ui, act: &mut Option<(&'static str, String)>) {
+            let t = solidcraft_ui_egui::theme::Tokens::get();
+            let pending = st.pending();
+            ui.horizontal(|ui| {
+                ui.strong("On disk");
+                match st.online() {
+                    Some(false) => {
+                        ui.colored_label(t.error, "the disk store can't be reached: showing this browser's copies").on_hover_text(st.last_error());
+                    }
+                    None => {
+                        ui.spinner();
+                    }
+                    Some(true) => {}
+                }
+                if !pending.is_empty() {
+                    let b = ui.small_button("Push now").on_hover_text("Send the designs that are not on disk yet");
+                    handle("web:files:push_now", &b);
+                    if b.clicked() {
+                        *act = Some(("push_now", String::new()));
+                    }
+                }
+            });
+            if !pending.is_empty() {
+                ui.colored_label(t.error, format!("NOT on disk yet (kept in this browser): {}", pending.join(", ")));
+            }
+            let entries = st.entries();
+            if entries.is_empty() {
+                ui.label(if st.loaded.get() {
+                    "Designs you save appear here. They are kept on the host's disk."
+                } else {
+                    "Reading the disk store…"
+                });
+            }
+            egui::ScrollArea::vertical().id_salt("store_files").max_height(300.0).show(ui, |ui| {
+                egui::Grid::new("store_files_grid").num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
+                    for e in &entries {
+                        if e.pending {
+                            ui.colored_label(t.error, format!("{} (not on disk yet)", e.name));
+                        } else {
+                            ui.label(&e.name);
+                        }
+                        ui.label(format!("{:.1} KB", e.size as f64 / 1024.0));
+                        ui.horizontal(|ui| {
+                            let design = solidcraft_engine::io::is_design_path(&e.name);
+                            if design {
+                                let b = ui.small_button("Open");
+                                handle(&format!("web:files:store_open:{}", e.name), &b);
+                                if b.clicked() {
+                                    *act = Some(("store_open", e.name.clone()));
+                                }
+                            }
+                            if ui.small_button("Download").clicked() {
+                                *act = Some(("store_download", e.name.clone()));
+                            }
+                        });
+                        ui.end_row();
+                    }
+                });
+            });
         }
 
         /// The stored designs: open, insert, rename, delete, download; open from the computer.
@@ -154,7 +287,8 @@ mod web {
             }
             let mut open = true;
             let mut act: Option<(&'static str, String)> = None;
-            egui::Window::new("Files in this browser")
+            let store = self.store.clone();
+            egui::Window::new(if store.is_some() { "Designs" } else { "Files in this browser" })
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(true)
@@ -174,6 +308,23 @@ mod web {
                         }
                     });
                     ui.separator();
+                    if let Some(st) = &store {
+                        Self::store_section(st, ui, &mut act);
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.strong("Only in this browser");
+                            let waiting =
+                                self.files.entries.borrow().iter().any(|e| solidcraft_engine::io::is_design_path(&e.name) && !st.was_copied(&e.name));
+                            if waiting {
+                                let b =
+                                    ui.button("Copy browser designs to disk").on_hover_text("A copy of each on the host's disk; they stay here too");
+                                handle("web:files:copy_all", &b);
+                                if b.clicked() {
+                                    act = Some(("copy_all", String::new()));
+                                }
+                            }
+                        });
+                    }
                     if !self.files.ready.get() {
                         ui.horizontal(|ui| {
                             ui.spinner();
@@ -183,7 +334,11 @@ mod web {
                     }
                     let entries = self.files.entries.borrow().clone();
                     if entries.is_empty() {
-                        ui.label("Designs you save appear here. They stay in this browser.");
+                        ui.label(if store.is_some() {
+                            "Nothing is kept only in this browser."
+                        } else {
+                            "Designs you save appear here. They stay in this browser."
+                        });
                     }
                     egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
                         egui::Grid::new("opfs_files").num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
@@ -203,7 +358,10 @@ mod web {
                                         }
                                     }
                                     _ => {
-                                        ui.label(&e.name);
+                                        match &store {
+                                            Some(st) if st.was_copied(&e.name) => ui.label(format!("{} (copied to disk)", e.name)),
+                                            _ => ui.label(&e.name),
+                                        };
                                     }
                                 }
                                 ui.label(format!("{:.1} KB", e.size as f64 / 1024.0));
@@ -237,7 +395,26 @@ mod web {
             }
             let Some((what, name)) = act else { return };
             let path = format!("{}{name}", files::OPFS);
+            let stored = format!("{STORE}{name}");
             match what {
+                "store_open" => {
+                    self.app.open_path(&stored);
+                    self.files.panel.set(false);
+                }
+                "store_download" => match vfs::read(&stored, solidcraft_engine::io::MAX_DESIGN_BYTES) {
+                    Ok(b) => {
+                        if let Err(e) = files::download(&name, &b) {
+                            self.app.set_status(e, true);
+                        }
+                    }
+                    Err(e) => self.app.set_status(e.to_string(), true),
+                },
+                "push_now" => {
+                    if let Some(st) = &self.store {
+                        st.push_now();
+                    }
+                }
+                "copy_all" => self.copy_browser_designs(),
                 "open" => {
                     self.app.open_path(&path);
                     self.files.panel.set(false);
@@ -293,7 +470,7 @@ mod web {
 
         /// Offer the autosave an earlier session left.
         fn recovery_prompt(&mut self, ctx: &egui::Context) {
-            let Some((name, path)) = self.files.recovery.borrow().clone() else { return };
+            let Some((name, path, base)) = self.files.recovery.borrow().clone() else { return };
             let mut answer = None;
             egui::Window::new("Recover unsaved work?").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(
                 ctx,
@@ -312,6 +489,11 @@ mod web {
             let Some(recover) = answer else { return };
             *self.files.recovery.borrow_mut() = None;
             if recover {
+                // A design from the disk store saves against the version it was based on, not
+                // whatever the store holds now (a newer one makes a conflict copy, never a loss).
+                if let (Some(st), Some(n)) = (&self.store, path.as_deref().and_then(|p| p.strip_prefix(STORE))) {
+                    st.pin(n, base);
+                }
                 self.app.open_path(&files::recovery_path());
                 // It belongs to its own file again (saving goes there); it is unsaved.
                 self.app.session.path = path;
@@ -320,6 +502,106 @@ mod web {
                 self.app.home.open = false;
             }
             files::autosave(&self.files, None);
+        }
+
+        /// The one-time copy of the designs kept only in this browser to the disk store.
+        fn copy_browser_designs(&mut self) {
+            let Some(st) = self.store.clone() else { return };
+            let designs: Vec<(String, Vec<u8>)> = self
+                .files
+                .entries
+                .borrow()
+                .iter()
+                .filter(|e| solidcraft_engine::io::is_design_path(&e.name))
+                .filter_map(|e| {
+                    vfs::read(&format!("{}{}", files::OPFS, e.name), solidcraft_engine::io::MAX_DESIGN_BYTES).ok().map(|b| (e.name.clone(), b))
+                })
+                .collect();
+            let n = st.copy_in(designs);
+            let text = if n == 0 {
+                "Nothing to copy: every design here is on disk already".to_string()
+            } else {
+                format!("Copying {n} design(s) to disk…")
+            };
+            self.app.set_status(text.clone(), false);
+            self.app.session.echo(text);
+        }
+
+        /// With a disk store, offer once to copy the designs kept only in this browser.
+        fn copy_offer(&mut self, ctx: &egui::Context) {
+            let Some(st) = self.store.clone() else { return };
+            if !st.loaded.get() || !self.files.ready.get() || st.offer_answered.get() || self.files.recovery.borrow().is_some() {
+                return;
+            }
+            let names: Vec<String> = self
+                .files
+                .entries
+                .borrow()
+                .iter()
+                .filter(|e| solidcraft_engine::io::is_design_path(&e.name) && !st.was_copied(&e.name))
+                .map(|e| e.name.clone())
+                .collect();
+            if names.is_empty() {
+                return;
+            }
+            let mut answer = None;
+            egui::Window::new("Copy designs to disk?").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(
+                ctx,
+                |ui| {
+                    ui.label(format!("{} design(s) are kept only in this browser, not on disk:", names.len()));
+                    ui.label(names.join(", "));
+                    ui.label("Copy them to the disk store? They stay in this browser too.");
+                    ui.horizontal(|ui| {
+                        let copy = ui.button("Copy to disk");
+                        handle("web:copy_offer:copy", &copy);
+                        if copy.clicked() {
+                            answer = Some(true);
+                        }
+                        let later = ui.button("Not now").on_hover_text("Open › Designs has the same button");
+                        handle("web:copy_offer:not_now", &later);
+                        if later.clicked() {
+                            answer = Some(false);
+                        }
+                    });
+                },
+            );
+            match answer {
+                Some(true) => self.copy_browser_designs(),
+                Some(false) => st.decline_offer(),
+                None => {}
+            }
+        }
+
+        /// While designs are not on disk (or the store can't be reached), say so where it can't
+        /// be missed: top right, under the title bar (the status line and the command line are
+        /// at the bottom).
+        fn store_badge(&mut self, ctx: &egui::Context) {
+            let Some(st) = self.store.clone() else { return };
+            let pending = st.pending();
+            let offline = st.online() == Some(false);
+            if pending.is_empty() && !offline {
+                return;
+            }
+            let t = solidcraft_ui_egui::theme::Tokens::get();
+            let text = match (pending.len(), offline) {
+                (0, _) => "Disk store unreachable: showing this browser's copies".to_string(),
+                (1, o) => format!("{} is NOT on disk yet{}", pending.join(""), if o { " (disk store unreachable)" } else { "" }),
+                (n, o) => format!("{n} designs are NOT on disk yet{}", if o { " (disk store unreachable)" } else { "" }),
+            };
+            egui::Area::new(egui::Id::new("store_badge")).anchor(egui::Align2::RIGHT_TOP, [-12.0, 40.0]).show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(t.error, text).on_hover_text(if offline { st.last_error() } else { pending.join(", ") });
+                        if !pending.is_empty() {
+                            let b = ui.small_button("Push now");
+                            handle("web:store_badge:push_now", &b);
+                            if b.clicked() {
+                                st.push_now();
+                            }
+                        }
+                    });
+                });
+            });
         }
 
         /// Fetch and install the CJK font when a CJK language is selected. If that fails, this
@@ -371,7 +653,8 @@ mod web {
             self.tick_font(ctx);
             self.app.logic(ctx);
             self.files_tick(ctx);
-            UNSAVED.with(|u| u.set(solidcraft_ui_egui::documents::any_dirty(&self.app)));
+            let unsent = self.store.as_ref().is_some_and(|s| !s.pending().is_empty());
+            UNSAVED.with(|u| u.set(solidcraft_ui_egui::documents::any_dirty(&self.app) || unsent));
         }
         fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
             files::take_drops(&self.files, raw);
@@ -380,8 +663,12 @@ mod web {
         fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
             self.app.ui(ui);
             let ctx = ui.ctx().clone();
+            // A save from this frame's clicks reaches the store (and the status line) at once.
+            self.files_tick(&ctx);
             self.file_panel(&ctx);
             self.recovery_prompt(&ctx);
+            self.copy_offer(&ctx);
+            self.store_badge(&ctx);
             self.watch_text_for_font(&ctx);
         }
         fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -391,6 +678,11 @@ mod web {
             storage.set_string(solidcraft_ui_egui::prefs::STORAGE_KEY, self.app.prefs());
             self.app.preferences.language = live;
         }
+    }
+
+    /// Where a button was drawn, for `ui.handles` / `ui.click` (agents and tests drive the page).
+    fn handle(name: &str, r: &egui::Response) {
+        solidcraft_ui_egui::scenario::publish_handle(name, r.rect.center());
     }
 
     fn query() -> String {
@@ -434,6 +726,12 @@ mod web {
                         solidcraft_ui_egui::fonts::setup_fonts(&cc.egui_ctx);
                         let files = Rc::new(Files::default());
                         files::start(&files);
+                        let store = store::url_from_query(&query()).map(|url| Rc::new(Store::new(url)));
+                        if let Some(st) = &store {
+                            store::start(st);
+                        }
+                        let active_path: Rc<std::cell::RefCell<Option<String>>> = Rc::default();
+                        let (save_store, save_active) = (store.clone(), active_path.clone());
                         let panel = files.clone();
                         let services = Services {
                             // Open shows the browser's files (and the computer's, from there).
@@ -441,10 +739,21 @@ mod web {
                                 panel.panel.set(true);
                                 None
                             })),
-                            // Designs are kept in the browser; everything else is downloaded.
-                            pick_save: Some(Box::new(|name: &str, exts: &[&str]| {
+                            // Designs are kept on disk (with a store) or in the browser; everything
+                            // else is downloaded. A new name never replaces another design on disk.
+                            pick_save: Some(Box::new(move |name: &str, exts: &[&str]| {
                                 let design = exts.contains(&solidcraft_engine::io::DESIGN_EXT);
-                                Some(format!("{}{name}", if design { files::OPFS } else { files::DOWNLOADS }))
+                                match &save_store {
+                                    Some(st) if design && store::valid_name(name) => {
+                                        let own = format!("{STORE}{name}");
+                                        if save_active.borrow().as_deref() == Some(own.as_str()) {
+                                            Some(own)
+                                        } else {
+                                            Some(format!("{STORE}{}", st.free_name(name)))
+                                        }
+                                    }
+                                    _ => Some(format!("{}{name}", if design { files::OPFS } else { files::DOWNLOADS })),
+                                }
                             })),
                             ..Default::default()
                         };
@@ -484,6 +793,9 @@ mod web {
                             recents_synced: false,
                             font: Default::default(),
                             font_result: Rc::new(std::cell::RefCell::new(None)),
+                            store,
+                            active_path,
+                            tick_path: None,
                         }))
                     }),
                 )

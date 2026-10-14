@@ -430,6 +430,9 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
                     } else if p.starts_with("/opfs/") {
                         // The web build keeps designs in the browser's own storage.
                         "in this browser".to_string()
+                    } else if p.starts_with("/store/") {
+                        // The web build's designs on the host's disk (`?store=`).
+                        "on disk".to_string()
                     } else {
                         p.clone()
                     };

@@ -3,7 +3,8 @@
 //! command writes one. Files come in from the computer through a file picker (the File System
 //! Access API where the browser has it, an `<input type=file>` otherwise) or a drop on the page,
 //! and go out as downloads (exports, and "Download design"). An autosave of unsaved work is kept
-//! in OPFS too and offered again after a reload or a crash.
+//! in OPFS too and offered again after a reload or a crash. With a disk store (`?store=`, see
+//! [`crate::store`]) designs live on a host instead, under [`STORE`], and OPFS keeps their copy.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -13,6 +14,8 @@ use solidcraft_engine::io::vfs;
 use wasm_bindgen::{JsCast as _, JsValue, closure::Closure};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{FileSystemDirectoryHandle, FileSystemFileHandle, FileSystemGetFileOptions, FileSystemWritableFileStream};
+
+use crate::store::{STORE, Store};
 
 /// Where OPFS files appear to the engine.
 pub const OPFS: &str = "/opfs/";
@@ -57,8 +60,9 @@ pub struct Files {
     pub ready: Cell<bool>,
     /// The file panel is open.
     pub panel: Cell<bool>,
-    /// An autosave left by an earlier session: its design's name and file.
-    pub recovery: RefCell<Option<(String, Option<String>)>>,
+    /// An autosave left by an earlier session: its design's name, its file and, for a design
+    /// from a disk store, the version it was based on.
+    pub recovery: RefCell<Option<(String, Option<String>, Option<String>)>>,
     /// The app's context, to wake it when a browser call finishes.
     pub ctx: RefCell<Option<egui::Context>>,
 }
@@ -192,6 +196,45 @@ async fn remove_file(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A folder in OPFS (made when missing).
+async fn sub_dir(name: &str) -> Result<FileSystemDirectoryHandle, String> {
+    if local_only() {
+        return Err("this browser has no private file storage (OPFS)".into());
+    }
+    let opts = web_sys::FileSystemGetDirectoryOptions::new();
+    opts.set_create(true);
+    JsFuture::from(root().await?.get_directory_handle_with_options(name, &opts))
+        .await
+        .map_err(err)?
+        .dyn_into()
+        .map_err(|_| "not a folder".to_string())
+}
+
+/// Every file in the OPFS folder `dir`: (name, bytes).
+pub async fn dir_files(dir: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
+    Ok(read_dir(&sub_dir(dir).await?).await?.into_iter().map(|(n, b, _)| (n, b)).collect())
+}
+
+/// Write `name` in the OPFS folder `dir`.
+pub async fn dir_write(dir: &str, name: &str, bytes: &[u8]) -> Result<(), String> {
+    let h = file_handle(&sub_dir(dir).await?, name, true).await?;
+    let w: FileSystemWritableFileStream =
+        JsFuture::from(h.create_writable()).await.map_err(err)?.dyn_into().map_err(|_| "no writable stream".to_string())?;
+    JsFuture::from(w.write_with_u8_array(bytes).map_err(err)?).await.map_err(err)?;
+    JsFuture::from(w.close()).await.map_err(err)?;
+    Ok(())
+}
+
+/// Remove `name` from the OPFS folder `dir` (a missing file is no error).
+pub async fn dir_remove(dir: &str, name: &str) -> Result<(), String> {
+    let d = sub_dir(dir).await?;
+    if file_handle(&d, name, false).await.is_err() {
+        return Ok(());
+    }
+    JsFuture::from(d.remove_entry(name)).await.map_err(err)?;
+    Ok(())
+}
+
 /// Every stored file in local storage.
 fn read_local() -> Result<Vec<(String, Vec<u8>, f64)>, String> {
     let st = local()?;
@@ -216,6 +259,11 @@ async fn read_all() -> Result<Vec<(String, Vec<u8>, f64)>, String> {
             return read_local();
         }
     };
+    read_dir(&dir).await
+}
+
+/// Every file in an OPFS folder (folders in it are skipped): (name, bytes, last modified).
+async fn read_dir(dir: &FileSystemDirectoryHandle) -> Result<Vec<(String, Vec<u8>, f64)>, String> {
     let iter: JsValue = dir.values().into();
     let next: Function = Reflect::get(&iter, &"next".into()).map_err(err)?.dyn_into().map_err(|_| "no iterator".to_string())?;
     let mut out = Vec::new();
@@ -270,7 +318,8 @@ pub fn start(files: &Rc<Files>) {
                     if name == RECOVERY_META {
                         let meta: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
                         let n = meta["name"].as_str().unwrap_or("Untitled").to_string();
-                        *files.recovery.borrow_mut() = Some((n, meta["path"].as_str().map(str::to_string)));
+                        let path = meta["path"].as_str().map(str::to_string);
+                        *files.recovery.borrow_mut() = Some((n, path, meta["store_base"].as_str().map(str::to_string)));
                         continue;
                     }
                     if name != RECOVERY {
@@ -292,10 +341,20 @@ pub fn start(files: &Rc<Files>) {
     });
 }
 
-/// Store what commands wrote: OPFS paths into OPFS, download paths as downloads.
-pub fn flush(files: &Rc<Files>) {
+/// Store what commands wrote: OPFS paths into OPFS, download paths as downloads, and paths in
+/// the disk store to the store. Returns the designs written to OPFS (names).
+pub fn flush(files: &Rc<Files>, store: Option<&Rc<Store>>) -> Vec<String> {
+    let mut designs = Vec::new();
     for (path, bytes) in vfs::take_writes() {
-        if let Some(name) = path.strip_prefix(OPFS) {
+        if let Some(name) = path.strip_prefix(STORE) {
+            match store {
+                Some(s) => s.save(name, bytes),
+                None => files.say(format!("{name}: this page has no disk store (open it with ?store=<url>)"), true),
+            }
+        } else if let Some(name) = path.strip_prefix(OPFS) {
+            if name != RECOVERY && name != RECOVERY_META && solidcraft_engine::io::is_design_path(name) {
+                designs.push(name.to_string());
+            }
             let name = name.to_string();
             {
                 let mut e = files.entries.borrow_mut();
@@ -317,6 +376,7 @@ pub fn flush(files: &Rc<Files>) {
             files.say(format!("{name}: {e}"), true);
         }
     }
+    designs
 }
 
 /// Hand `bytes` to the user as a download named `name`.
@@ -367,15 +427,16 @@ pub fn rename(files: &Rc<Files>, from: &str, to: &str) -> Result<(), String> {
     let bytes = vfs::read(&format!("{OPFS}{from}"), solidcraft_engine::io::MAX_DESIGN_BYTES).map_err(|e| e.to_string())?;
     vfs::write(&format!("{OPFS}{to}"), &bytes).map_err(|e| e.to_string())?;
     delete(files, from);
-    flush(files);
+    // The next frame stores the copy.
+    files.wake();
     Ok(())
 }
 
 /// Keep (or drop) the autosave of the open design.
-pub fn autosave(files: &Rc<Files>, doc: Option<(&solidcraft_engine::doc::Document, Option<&str>)>) {
+pub fn autosave(files: &Rc<Files>, doc: Option<(&solidcraft_engine::doc::Document, Option<&str>, Option<String>)>) {
     let files = files.clone();
     match doc {
-        Some((d, path)) => {
+        Some((d, path, store_base)) => {
             let bytes = match solidcraft_engine::io::write_design_container(d) {
                 Ok(bytes) => bytes,
                 Err(e) => {
@@ -383,7 +444,7 @@ pub fn autosave(files: &Rc<Files>, doc: Option<(&solidcraft_engine::doc::Documen
                     return;
                 }
             };
-            let meta = serde_json::json!({"name": d.name, "path": path, "saved_at": js_sys::Date::now()}).to_string();
+            let meta = serde_json::json!({"name": d.name, "path": path, "store_base": store_base, "saved_at": js_sys::Date::now()}).to_string();
             spawn_local(async move {
                 let r = async {
                     write_file(RECOVERY, &bytes).await?;
