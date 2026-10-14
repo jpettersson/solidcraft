@@ -103,3 +103,15 @@ Use **Open from computer…** in the same panel to reopen a downloaded design. T
 works on a browser-stored copy; later saves do not update the original downloaded file.
 Use **Rename** beside a stored file to change its name. Exports such as STEP and STL are
 also downloaded.
+
+### Designs on a server's disk
+
+A web app opened with `?store=<url>` keeps designs in a design store on a server (this page's
+own address, or one on the same computer) instead: the same designs on every device that opens
+it. **Open** then shows **Designs**: the ones **On disk**, and any **Only in this browser**,
+with **Copy browser designs to disk**. Saves go to the disk; if a design changed there since
+you opened it (on another device, say), your save goes beside it as
+`<name> (conflict <date> <time>)` and nothing is overwritten. When the server can't be reached,
+saves wait in the browser, marked **NOT on disk yet**, and are sent when it answers again.
+See [docs/web-store.md](https://github.com/bherbruck/solidcraft/blob/main/docs/web-store.md)
+for the store's protocol.

@@ -268,6 +268,21 @@ fn dirty(app: &SolveApp, i: usize) -> bool {
     app.docs.slots.get(i).and_then(Option::as_ref).is_some_and(|s| s.session.is_dirty())
 }
 
+/// The files the open designs belong to, in tab order (designs never saved have none).
+pub fn paths(app: &SolveApp) -> Vec<String> {
+    if app.docs.slots.is_empty() {
+        return app.session.path.iter().cloned().collect();
+    }
+    app.docs
+        .slots
+        .iter()
+        .filter_map(|s| match s {
+            Some(d) => d.session.path.clone(),
+            None => app.session.path.clone(),
+        })
+        .collect()
+}
+
 /// Tab names (with an unsaved-changes flag), in order.
 pub fn tabs_info(app: &SolveApp) -> Vec<(String, bool)> {
     if app.docs.slots.is_empty() {
@@ -617,6 +632,22 @@ mod tests {
         assert_eq!(a.docs.active, 0);
         close(&mut a, 0, true);
         assert!(active_is_blank(&a) && a.home.open);
+    }
+
+    /// The web page's disk store keeps each open design's version by its file: every tab's
+    /// file is listed, the active one's included, and designs never saved have none.
+    #[test]
+    fn paths_list_every_open_designs_file() {
+        let mut a = app();
+        assert!(paths(&a).is_empty());
+        a.session.path = Some("/store/a.solidcraft".into());
+        assert_eq!(paths(&a), ["/store/a.solidcraft"]);
+        new_design(&mut a);
+        assert_eq!(paths(&a), ["/store/a.solidcraft"], "a new design has no file yet");
+        a.session.path = Some("/store/b.solidcraft".into());
+        assert_eq!(paths(&a), ["/store/a.solidcraft", "/store/b.solidcraft"]);
+        switch(&mut a, 0);
+        assert_eq!(paths(&a), ["/store/a.solidcraft", "/store/b.solidcraft"]);
     }
 
     /// Quitting asks once per design with unsaved changes: Don't Save moves on (and keeps no
