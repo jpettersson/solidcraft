@@ -212,8 +212,9 @@ fn refused(command: &str, args: &Value) -> Option<String> {
         return None;
     }
     Some(format!(
-        "{command}: this page can't keep the design at the host path {path} (a later Save in the browser would not reach it). Use file.export {{\"path\": \"{path}\"}} for a copy on the host, or save under {}",
-        files::OPFS
+        "{command}: this page can't keep the design at the host path {path} (a later Save in the browser would not reach it). Use file.export {{\"path\": \"{path}\"}} for a copy on the host, or save under {} (this browser) or {} (the disk store, when the page has one)",
+        files::OPFS,
+        crate::store::STORE
     ))
 }
 
@@ -257,9 +258,12 @@ fn written_file(command: &str, reply: &Map<String, Value>, incoming: &BTreeSet<S
     Some(Value::Object(out))
 }
 
-/// A path on the host, not one of the browser's own (stored designs, downloads, uploads).
+/// A path on the host, not one of the page's own (stored designs in the browser or the disk
+/// store, downloads, uploads).
 fn is_host_path(path: &str) -> bool {
-    path.starts_with('/') && ![files::OPFS, files::DOWNLOADS, files::UPLOAD].iter().any(|p| path.starts_with(p)) && !path.contains('\0')
+    path.starts_with('/')
+        && ![files::OPFS, crate::store::STORE, files::DOWNLOADS, files::UPLOAD].iter().any(|p| path.starts_with(p))
+        && !path.contains('\0')
 }
 
 fn hidden() -> bool {
