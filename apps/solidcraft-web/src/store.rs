@@ -467,7 +467,14 @@ mod web {
         }
 
         fn say(&self, text: impl Into<String>, error: bool) {
-            self.messages.borrow_mut().push((text.into(), error));
+            let text = text.into();
+            // Also in the console: the status line shows a message for a few seconds only.
+            if error {
+                log::warn!("store: {text}");
+            } else {
+                log::info!("store: {text}");
+            }
+            self.messages.borrow_mut().push((text, error));
             self.wake();
         }
 
@@ -677,9 +684,7 @@ mod web {
                             let text = match &kind {
                                 Kind::Save => format!("{name} saved to disk"),
                                 Kind::Copy => format!("{name} copied to disk"),
-                                Kind::Conflict { of } => format!(
-                                    "{of} changed on disk since it was opened here (another device, an agent or git): your version is on disk as {name}"
-                                ),
+                                Kind::Conflict { of } => format!("{of} changed on disk since you opened it: yours is now on disk as {name}"),
                             };
                             self.say(text, matches!(kind, Kind::Conflict { .. }));
                         }
