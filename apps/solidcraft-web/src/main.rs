@@ -567,7 +567,8 @@ mod web {
         }
 
         /// While designs are not on disk (or the store can't be reached), say so where it can't
-        /// be missed.
+        /// be missed: top right, under the title bar (the status line and the command line are
+        /// at the bottom).
         fn store_badge(&mut self, ctx: &egui::Context) {
             let Some(st) = self.store.clone() else { return };
             let pending = st.pending();
@@ -581,7 +582,7 @@ mod web {
                 (1, o) => format!("{} is NOT on disk yet{}", pending.join(""), if o { " (disk store unreachable)" } else { "" }),
                 (n, o) => format!("{n} designs are NOT on disk yet{}", if o { " (disk store unreachable)" } else { "" }),
             };
-            egui::Area::new(egui::Id::new("store_badge")).anchor(egui::Align2::RIGHT_BOTTOM, [-12.0, -40.0]).show(ctx, |ui| {
+            egui::Area::new(egui::Id::new("store_badge")).anchor(egui::Align2::RIGHT_TOP, [-12.0, 40.0]).show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.colored_label(t.error, text).on_hover_text(if offline { st.last_error() } else { pending.join(", ") });

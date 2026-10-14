@@ -732,7 +732,7 @@ mod web {
                         self.changed.set(true);
                         self.say(
                             format!(
-                                "{of} changed on disk since it was opened here (another device, an agent or git), so it was not replaced: your version goes beside it as {target}, and this design saves there from now on"
+                                "{of} changed on disk since you opened it (another device, an agent or git), so it was not replaced: yours is saved beside it as {target}"
                             ),
                             true,
                         );
@@ -751,7 +751,7 @@ mod web {
                             drop(queue);
                             self.say(
                                 format!(
-                                    "{name} is NOT on disk yet: the disk store can't be reached ({error}). It is kept in this browser and sent when the store is back."
+                                    "{name} is NOT on disk yet (the disk store can't be reached): kept in this browser, sent when the store is back"
                                 ),
                                 true,
                             );
@@ -806,7 +806,7 @@ mod web {
                         self.told_changed.borrow_mut().insert(name.clone(), r.etag.clone());
                         self.say(
                             format!(
-                                "{name} changed on disk while it is open here (another device, an agent or git). Open it again to see that version; saving this one keeps both."
+                                "{name} changed on disk (another device, an agent or git): open it again to see that version; saving yours keeps both"
                             ),
                             false,
                         );
