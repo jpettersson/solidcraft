@@ -135,6 +135,42 @@ unit regardless of the design, pass an expression with one: `"value": "50 mm"` o
 `solidcraft-cli mcp --connect 127.0.0.1:PORT` bridges an MCP client (an AI agent) to this
 channel; see [mcp.md](mcp.md).
 
+## Web app
+
+A page cannot listen on a socket, so the browser version takes the same requests the other way
+round: opened with `?control=<url>`, it long-polls a relay at `<url>` and runs each request
+through the same handler as `--control`. The relay is a separate program on the host that
+listens for these JSON lines on a TCP port and passes them to the page, so the MCP bridge and
+other clients connect to it as they would to the desktop app. `<url>` must be the page's own
+origin or loopback (`127.0.0.1`, `localhost`, `[::1]`); any other is ignored, so a link cannot
+hand someone's design to a remote server. Otherwise the page behaves as it does without the
+flag: it opens on the start page (the designs stored in the browser) and offers to recover an
+autosave, because the person looking at it may reload it. A client that wants the design view
+hides the start page with `ui.home {"open": false}`.
+
+- `GET <url>/next?tab=<id>&hidden=0|1`: the next request, `{"id", "method", "params", "files"?}`
+  (200), nothing within the relay's wait (204), or 409 when a newer page has taken over (the
+  page then stops polling). `tab` is random per page load; `hidden` is `document.hidden`.
+- `POST <url>/reply?tab=<id>`: the reply line, `{"id", "ok", "result"|"error", "files"?}`, with
+  the request's `id`. The page runs one request at a time and polls again only after replying.
+
+The page has no access to the host's disk; files cross beside the message as `files: {path:
+base64}`. A request's files are placed in the engine's in-memory file table first (so `doc.open
+{path}` reads them). When a successful reply's `result.path` is a host path that the request
+wrote (`ui.screenshot`, `ui.render`, `file.export`, `file.save_mesh`), the page attaches that
+file and drops its copy; the relay writes it to `path` before it answers. No other reply carries
+a file: one that merely mentions a path (`document.inspect`) never writes the host. Paths under
+`/opfs/`, `/downloads/` and `/upload/` are the browser's own and never cross.
+
+The design open in the page is kept by the page, so its own file must be one the page stores:
+`file.save`/`file.save_as` to a host path are refused (a later Save in the browser could not
+reach that file); use `file.export {path}` for a copy on the host. A design opened from a host
+path (`doc.open`, `ui.file`) is kept in the browser as a copy under `/opfs/`, as one opened from
+the computer is, and the reply names that copy. At most 8 files of 48 MiB
+each travel with one message. As natively, a request the page has not answered within 60
+seconds gets `{"ok": false, "error": "timeout"}`. A hidden tab still answers, slowly: the
+browser runs its frames about once a second.
+
 ## Example
 
 ```text
