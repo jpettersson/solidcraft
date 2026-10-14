@@ -157,9 +157,16 @@ hides the start page with `ui.home {"open": false}`.
 The page has no access to the host's disk; files cross beside the message as `files: {path:
 base64}`. A request's files are placed in the engine's in-memory file table first (so `doc.open
 {path}` reads them). When a successful reply's `result.path` is a host path that the request
-wrote (`ui.screenshot`, `ui.render`, `file.save`, `file.export`), the page attaches that file
-and drops its copy; the relay writes it to `path` before it answers. Paths under `/opfs/`,
-`/downloads/` and `/upload/` are the browser's own and never cross. At most 8 files of 48 MiB
+wrote (`ui.screenshot`, `ui.render`, `file.export`, `file.save_mesh`), the page attaches that
+file and drops its copy; the relay writes it to `path` before it answers. No other reply carries
+a file: one that merely mentions a path (`document.inspect`) never writes the host. Paths under
+`/opfs/`, `/downloads/` and `/upload/` are the browser's own and never cross.
+
+The design open in the page is kept by the page, so its own file must be one the page stores:
+`file.save`/`file.save_as` to a host path are refused (a later Save in the browser could not
+reach that file); use `file.export {path}` for a copy on the host. A design opened from a host
+path (`doc.open`, `ui.file`) is kept in the browser as a copy under `/opfs/`, as one opened from
+the computer is, and the reply names that copy. At most 8 files of 48 MiB
 each travel with one message. As natively, a request the page has not answered within 60
 seconds gets `{"ok": false, "error": "timeout"}`. A hidden tab still answers, slowly: the
 browser runs its frames about once a second.

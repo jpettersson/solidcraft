@@ -9,8 +9,13 @@
 //! The page cannot reach the host's disk, so files cross beside the message, base64-encoded:
 //! a request's `files` (`{path: data}`) go into the engine's file table before it runs, so
 //! `doc.open` finds them; a reply carries the file its `result.path` names when the request
-//! wrote it there (`ui.screenshot`, `ui.render`, `file.save`, `file.export`), for the relay to
-//! write to that path.
+//! wrote it there (`ui.screenshot`, `ui.render`, `file.export`, `file.save_mesh`), for the relay
+//! to write to that path. Nothing else is sent back: a read-only request never writes the host.
+//!
+//! A design the page has open is kept by the page itself, so its own file must be one the page
+//! stores. `file.save`/`file.save_as` to a host path are refused (a later Save in the browser
+//! would only reach the page's memory), and a design opened from a host path is kept in the
+//! browser as a copy, as one opened from the computer is.
 
 use std::collections::BTreeSet;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
@@ -31,6 +36,13 @@ const REPLY_TIMEOUT_MS: f64 = 60_000.0;
 /// Waits between attempts while the relay cannot be reached.
 const RETRY_MIN_MS: i32 = 500;
 const RETRY_MAX_MS: i32 = 10_000;
+/// Requests whose `result.path` names a file they wrote to a host path, carried back.
+const WRITERS: [&str; 4] = ["ui.screenshot", "ui.render", "file.export", "file.save_mesh"];
+/// Requests that make `path` the open design's own file.
+const SAVERS: [&str; 2] = ["file.save", "file.save_as"];
+/// Requests that open `path` as a design (`ui.file` unless it inserts).
+const OPENERS: [&str; 2] = ["doc.open", "ui.file"];
+
 /// Largest file carried in either direction.
 const MAX_FILE_BYTES: usize = 48 << 20;
 /// Files one request may carry.
@@ -111,11 +123,21 @@ async fn run(base: String, tab: String, tx: Sender<ControlRequest>, ctx: egui::C
 async fn serve(msg: &Value, tx: &Sender<ControlRequest>, ctx: &egui::Context) -> Option<Value> {
     let id = msg.get("id").cloned().unwrap_or(Value::Null);
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("").to_string();
-    let params = msg.get("params").cloned().unwrap_or(json!({}));
+    let mut params = msg.get("params").cloned().unwrap_or(json!({}));
+    let command = command_of(&method, &params);
+    if let Some(e) = refused(&command, args(&method, &params)) {
+        return Some(json!({"id": id, "ok": false, "error": e}));
+    }
     let incoming = match take_files(msg.get("files")) {
         Ok(paths) => paths,
         Err(e) => return Some(json!({"id": id, "ok": false, "error": e})),
     };
+    if OPENERS.contains(&command.as_str())
+        && args(&method, &params).get("insert").and_then(Value::as_bool) != Some(true)
+        && let Some(a) = args_mut(&method, &mut params)
+    {
+        keep_opened_copy(a, &incoming);
+    }
     let (req, rrx) = ControlRequest::new(method, params);
     tx.send(req).ok()?;
     ctx.request_repaint();
@@ -129,7 +151,7 @@ async fn serve(msg: &Value, tx: &Sender<ControlRequest>, ctx: &egui::Context) ->
         }
     };
     if let Some(o) = reply.as_object_mut() {
-        if let Some(out) = written_file(o, &incoming) {
+        if let Some(out) = written_file(&command, o, &incoming) {
             o.insert("files".into(), out);
         }
         o.insert("id".into(), id);
@@ -158,10 +180,70 @@ fn take_files(files: Option<&Value>) -> Result<BTreeSet<String>, String> {
     Ok(paths)
 }
 
+/// The command a request runs: `engine.execute`'s (or `command`'s) `command`, else the method.
+fn command_of(method: &str, params: &Value) -> String {
+    match method {
+        "engine.execute" | "command" => params.get("command").or_else(|| params.get("id")).and_then(Value::as_str).unwrap_or("").to_string(),
+        _ => method.to_string(),
+    }
+}
+
+/// The command's own parameters (`engine.execute` nests them under `params`).
+fn args<'a>(method: &str, params: &'a Value) -> &'a Value {
+    match method {
+        "engine.execute" | "command" => params.get("params").unwrap_or(&Value::Null),
+        _ => params,
+    }
+}
+
+fn args_mut<'a>(method: &str, params: &'a mut Value) -> Option<&'a mut Value> {
+    match method {
+        "engine.execute" | "command" => params.get_mut("params"),
+        _ => Some(params),
+    }
+}
+
+/// Why the page won't run this request, if it won't: a save to a host path would make the host
+/// file the design's own, and a later Save in the browser can't reach it (it would stay in the
+/// page's memory while saying "Save done").
+fn refused(command: &str, args: &Value) -> Option<String> {
+    let path = args.get("path").and_then(Value::as_str)?;
+    if !SAVERS.contains(&command) || !is_host_path(path) {
+        return None;
+    }
+    Some(format!(
+        "{command}: this page can't keep the design at the host path {path} (a later Save in the browser would not reach it). Use file.export {{\"path\": \"{path}\"}} for a copy on the host, or save under {}",
+        files::OPFS
+    ))
+}
+
+/// A design opened from a host path is kept in the browser (a copy, as one opened from the
+/// computer is), so the person's later saves are stored: the request opens the copy instead.
+fn keep_opened_copy(args: &mut Value, incoming: &BTreeSet<String>) {
+    let Some(path) = args.get("path").and_then(Value::as_str).map(str::to_string) else { return };
+    if !incoming.contains(&path) || !solidcraft_engine::io::is_design_path(&path) {
+        return;
+    }
+    let Ok(bytes) = vfs::read(&path, MAX_FILE_BYTES) else { return };
+    let name = path.rsplit('/').next().unwrap_or("design.solidcraft");
+    // The same design opened again reuses its copy.
+    let same = format!("{}{name}", files::OPFS);
+    let copy = if vfs::read(&same, MAX_FILE_BYTES).is_ok_and(|b| b == bytes) { same } else { files::free_name(name) };
+    if vfs::write(&copy, &bytes).is_err() {
+        return;
+    }
+    let _ = vfs::remove(&path);
+    if let Some(o) = args.as_object_mut() {
+        o.insert("path".into(), Value::String(copy));
+    }
+}
+
 /// The file a successful reply's `result.path` names, when this request wrote it to a host
-/// path: `{path: base64}`. It leaves the page's memory once handed over.
-fn written_file(reply: &Map<String, Value>, incoming: &BTreeSet<String>) -> Option<Value> {
-    if reply.get("ok").and_then(Value::as_bool) != Some(true) {
+/// path: `{path: base64}`. Only requests that write files ([`WRITERS`]) send one: a reply that
+/// merely mentions a path (`document.inspect`) never writes the host. It leaves the page's
+/// memory once handed over.
+fn written_file(command: &str, reply: &Map<String, Value>, incoming: &BTreeSet<String>) -> Option<Value> {
+    if !WRITERS.contains(&command) || reply.get("ok").and_then(Value::as_bool) != Some(true) {
         return None;
     }
     let path = reply.get("result")?.get("path")?.as_str()?;
