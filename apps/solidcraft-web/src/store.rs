@@ -626,6 +626,14 @@ mod web {
         pub fn tick(self: &Rc<Self>, open_paths: &[String], loading: bool) -> Vec<(String, String)> {
             let open: BTreeSet<String> = open_paths.iter().filter_map(|p| p.strip_prefix(STORE)).map(str::to_string).collect();
             let moved = self.apply_done(&open);
+            // A design that now saves to its conflict copy no longer holds the old file open.
+            let mut open = open;
+            for (from, to) in &moved {
+                if let (Some(f), Some(t)) = (from.strip_prefix(STORE), to.strip_prefix(STORE)) {
+                    open.remove(f);
+                    open.insert(t.to_string());
+                }
+            }
             if !loading {
                 self.apply_fetched(&open);
                 self.reconcile(&open);
